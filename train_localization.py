@@ -84,7 +84,7 @@ def main():
     arg('--distributed', action='store_true', default=False)
     arg('--freeze-epochs', type=int, default=1)
     arg("--local_rank", default=0, type=int)
-    arg("--opt-level", default='O1', type=str)
+    arg("--opt-level", default='O0', type=str)
     arg("--predictions", default="../oof_preds", type=str)
     arg("--test_every", type=int, default=1)
 

@@ -198,7 +198,6 @@ def label_mask(loc, labels, intensity, mask, seed_threshold=0.8):
 def post_process(loc, damage, out_loc, out_damage):
     localization = loc/255.
     damage = damage/255.
-    #damage = np.moveaxis(damage[1:, ...], 0, -1)/255.
     first = np.zeros((1024, 1024, 1))
     first[:, :, 0] = 1 - np.sum(damage, axis=2)
     first[:, :, :] *= 0.8
