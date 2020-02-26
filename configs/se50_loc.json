@@ -1,0 +1,39 @@
+{
+  "network": "scse_unet",
+  "encoder": "seresnext50",
+    "fp16": true,
+  "data_multiplier": 1,
+  "num_classes": 1,
+  "optimizer": {
+        "batch_size": 10,
+        "type": "FusedAdam",
+        "clip": 3,
+        "learning_rate": 0.0001,
+        "schedule": {
+            "type": "step",
+            "mode": "epoch",
+            "epochs": 140,
+            "params": {
+              "steps": [[0,0.0003],[1, 0.0001],[10,0.00005],[40,0.00003],[50,0.00001],[90,0.000005],[120,0.000002],[130,0.000001]]
+            }
+        }
+    },
+    "input": {
+      "crop_height": 512,
+      "crop_width": 512,
+      "normalize": {"mean": [0.485, 0.456, 0.406, 0.485, 0.456, 0.406 ], "std": [0.229, 0.224, 0.225, 0.229, 0.224, 0.225]}
+    },
+   "mask_loss": {
+    "type": "ComboLoss",
+    "params": {
+      "weights": {
+        "dice": 1,
+        "focal": 1,
+        "bce": 1
+      },
+      "ohpm": false,
+      "ohpm_pixels": 131072,
+      "per_image": false
+    }
+  }
+}
