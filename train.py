@@ -7,6 +7,8 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 
+from torch.utils.data.distributed import DistributedSampler
+
 import cv2
 
 cv2.ocl.setUseOpenCL(False)
@@ -16,7 +18,7 @@ import models
 from augs import Lighting, RandomSizedCropAroundBbox
 
 from albumentations import Compose, HorizontalFlip, VerticalFlip, RGBShift, RandomBrightnessContrast, \
-    RandomGamma, RandomRotate90, Transpose
+    RandomGamma, RandomRotate90, Transpose, Blur, Rotate
 
 import losses
 from dataset.xview_dataset import XviewSingleDataset
@@ -28,8 +30,6 @@ from tools.config import load_config
 from tools.utils import create_optimizer, AverageMeter
 
 from apex import amp
-
-from losses import dice_round
 
 import numpy as np
 import torch
@@ -47,14 +47,16 @@ def create_train_transforms(conf):
     width = conf['crop_width']
     return Compose([
         RandomSizedCropAroundBbox(min_max_height=(int(height * 0.8), int(height * 1.2)), w2h_ratio=1., height=height,
-                               width=width, p=1),
+                                  width=width, p=1),
+        Rotate(limit=10, p=0.1),
         HorizontalFlip(),
+        Blur(p=0.3),
         VerticalFlip(),
         RandomRotate90(),
         Transpose(),
         Lighting(alphastd=0.3),
-        RandomBrightnessContrast(p=0.2),
-        RandomGamma(p=0.2),
+        RandomBrightnessContrast(p=0.3),
+        RandomGamma(p=0.3),
         RGBShift(p=0.2)
     ], additional_targets={'image1': 'image'}
     )
@@ -69,12 +71,12 @@ def main():
     parser = argparse.ArgumentParser("PyTorch Xview Pipeline")
     arg = parser.add_argument
     arg('--config', metavar='CONFIG_FILE', help='path to configuration file')
-    arg('--workers', type=int, default=6, help='number of cpu threads to use')
+    arg('--workers', type=int, default=4, help='number of cpu threads to use')
     arg('--gpu', type=str, default='0', help='List of GPUs for parallel training, e.g. 0,1,2,3')
     arg('--output-dir', type=str, default='weights/')
     arg('--resume', type=str, default='')
     arg('--fold', type=int, default=0)
-    arg('--prefix', type=str, default='damage_')
+    arg('--prefix', type=str, default='softmax_')
     arg('--data-dir', type=str, default="/home/selim/datasets/xview/train")
     arg('--folds-csv', type=str, default='folds.csv')
     arg('--logdir', type=str, default='logs')
@@ -105,8 +107,7 @@ def main():
     if args.distributed:
         model = convert_syncbn_model(model)
     damage_loss_function = losses.__dict__[conf["damage_loss"]["type"]](**conf["damage_loss"]["params"]).cuda()
-    mask_loss_function = losses.__dict__[conf["mask_loss"]["type"]](**conf["mask_loss"]["params"]).cuda()
-    loss_functions = {"damage_loss": damage_loss_function, "mask_loss": mask_loss_function}
+    loss_functions = {"damage_loss": damage_loss_function}
     optimizer, scheduler = create_optimizer(conf['optimizer'], model)
 
     dice_best = 0
@@ -120,7 +121,9 @@ def main():
                                     folds_csv=args.folds_csv,
                                     transforms=create_train_transforms(conf['input']),
                                     multiplier=conf["data_multiplier"],
-                                    normalize=conf["input"].get("normalize", None))
+                                    normalize=conf["input"].get("normalize", None),
+                                    equibatch=False
+                                    )
     data_val = XviewSingleDataset(mode="val",
                                   fold=args.fold,
                                   data_path=args.data_dir,
@@ -130,10 +133,10 @@ def main():
                                   )
     train_sampler = None
     if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(data_train)
+        train_sampler = DistributedSampler(data_train)
 
     train_data_loader = DataLoader(data_train, batch_size=batch_size, num_workers=args.workers,
-                                   shuffle=train_sampler is None, sampler=train_sampler, pin_memory=False,
+                                   shuffle=False, sampler=train_sampler, pin_memory=False,
                                    drop_last=True)
     val_batch_size = 1
     val_data_loader = DataLoader(data_val, batch_size=val_batch_size, num_workers=args.workers, shuffle=False,
@@ -203,6 +206,9 @@ def main():
                 model.module.encoder_stages.train()
                 for p in model.module.encoder_stages.parameters():
                     p.requires_grad = True
+
+        if train_sampler:
+            train_sampler.set_epoch(current_epoch)
         train_epoch(current_epoch, loss_functions, model, optimizer, scheduler, train_data_loader, summary_writer, conf,
                     args.local_rank)
 
@@ -275,23 +281,18 @@ def validate(net, data_loader, predictions_dir):
             original_mask = sample["original_mask"].cuda().long().cpu().numpy()
 
             output = net(imgs)
-            binary_pred = torch.sigmoid(output[:, 4:, ...])
-
-            damage_preds = torch.sigmoid(output[:, :4, ...]).cpu().numpy()
+            damage_preds = torch.softmax(output, dim=1).cpu().numpy()
             for i in range(output.shape[0]):
                 damage_pred = damage_preds[i]
-                first = np.zeros((1, 1024, 1024))
-                first[:, :, :] = 0.1
-                damage_pred = np.concatenate([first, damage_pred], axis=0)
+                argmax = np.argmax(damage_pred, axis=0)
+
                 cv2.imwrite(os.path.join(preds_dir,
                                          "test_localization_" + sample["img_name"][i] + "_prediction.png"),
-                            (binary_pred[i, 0].cpu().numpy() > 0.3) * 1)
-                cv2.imwrite(os.path.join(preds_dir,
-                                         "test_damage_" + sample["img_name"][i] + "_prediction.png"),
-                            np.argmax(damage_pred, axis=0))
-                cv2.imwrite(os.path.join(targs_dir,
-                                         "test_localization_" + sample["img_name"][i] + "_target.png"),
                             mask.cpu().numpy()[i, 4])
+                cv2.imwrite(os.path.join(preds_dir, "test_damage_" + sample["img_name"][i] + "_prediction.png"),
+                            argmax)
+                cv2.imwrite(os.path.join(targs_dir, "test_localization_" + sample["img_name"][i] + "_target.png"),
+                            1 * (argmax > 0))
                 cv2.imwrite(
                     os.path.join(targs_dir, "test_damage_" + sample["img_name"][i] + "_target.png"),
                     original_mask[i])
@@ -304,36 +305,20 @@ def validate(net, data_loader, predictions_dir):
 def train_epoch(current_epoch, loss_functions, model, optimizer, scheduler, train_data_loader, summary_writer, conf,
                 local_rank):
     losses = AverageMeter()
-    damage_f1 = AverageMeter()
-    localization_f1 = AverageMeter()
     iterator = tqdm(train_data_loader)
     model.train()
     if conf["optimizer"]["schedule"]["mode"] == "epoch":
         scheduler.step(current_epoch)
     for i, sample in enumerate(iterator):
         imgs = sample["image"].cuda()
-        masks = sample["mask"].cuda().float()
+        masks = sample["original_mask"].cuda().long()
         out_mask = model(imgs)
-        mask_band = 4
-        with torch.no_grad():
-            pred = torch.sigmoid(out_mask[:, :, ...])
-            d = dice_round(pred[:, mask_band:, ...], masks[:, mask_band:, ...], t=0.5).item()
-            loc_f1 = 0
-            for i in range(4):
-                loc_f1 += 1/(dice_round(pred[:, i:i+1, ...], masks[:, i:i+1, ...], t=0.3).item() + 1e-3)
-            loc_f1 = 4/loc_f1
-        localization_f1.update(d, imgs.size(0))
-        damage_f1.update(loc_f1, imgs.size(0))
 
-        mask_loss = loss_functions["mask_loss"](out_mask[:, mask_band:, ...].contiguous(),
-                                                masks[:, mask_band:, ...].contiguous())
-        damage_loss = loss_functions["damage_loss"](out_mask[:, :mask_band, ...].contiguous(),
-                                                    masks[:, :mask_band, ...].contiguous())
-        loss = 0.7 * damage_loss + 0.3 * mask_loss
+        loss = loss_functions["damage_loss"](out_mask, masks)
         losses.update(loss.item(), imgs.size(0))
         iterator.set_description(
-            "epoch: {}; lr {:.7f}; Loss ({loss.avg:.4f}); Localization F1 ({dice.avg:.4f}); Damage F1 ({damage.avg:.4f}); ".format(
-                current_epoch, scheduler.get_lr()[-1], loss=losses, dice=localization_f1, damage=damage_f1))
+            "epoch: {}; lr {:.7f}; Loss ({loss.avg:.4f});".format(
+                current_epoch, scheduler.get_lr()[-1], loss=losses))
         optimizer.zero_grad()
         if conf['fp16']:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
